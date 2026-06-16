@@ -32,20 +32,36 @@ def setup_logging(log_file='training_new.log'):
     return logging.getLogger(__name__)
 
 logger = setup_logging()
-class SoftJaccardLoss(nn.Module):
-    """
-    Differentiable Jaccard loss for multi-label classification
-    """
-    def __init__(self, eps=1e-7):
-        super().__init__()
-        self.eps = eps
 
-    def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
-        intersection = (probs * targets).sum(dim=1)
-        union = probs.sum(dim=1) + targets.sum(dim=1) - intersection
-        jaccard = (intersection + self.eps) / (union + self.eps)
-        return 1 - jaccard.mean()
+
+def set_seed(seed=42):
+    """Seed all RNGs for reproducible runs."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def build_optimizer(model, config):
+    """AdamW with discriminative learning rates.
+
+    The freshly-initialized classifier head is trained at a higher LR than the
+    (partially unfrozen) pretrained backbone, which converges faster and more
+    stably than a single shared LR.
+    """
+    head_param_ids = {id(p) for p in model.classifier.parameters()}
+    head_params = [p for p in model.classifier.parameters() if p.requires_grad]
+    backbone_params = [p for p in model.parameters()
+                       if p.requires_grad and id(p) not in head_param_ids]
+    param_groups = [
+        {'params': backbone_params, 'lr': config['lr']},
+        {'params': head_params, 'lr': config['lr'] * config.get('head_lr_mult', 10)},
+    ]
+    return torch.optim.AdamW(param_groups, weight_decay=config['weight_decay'])
+
 
 class FocalLoss(nn.Module):
     """Focal Loss for handling class imbalance in multi-label classification"""
@@ -57,16 +73,18 @@ class FocalLoss(nn.Module):
     
     def forward(self, inputs, targets):
         BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-BCE_loss)
-        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
-        
-        # Apply class weights if provided
+        pt = torch.exp(-BCE_loss)  # probability of the true class
+
+        # Proper alpha balancing: alpha for positives, (1 - alpha) for negatives.
+        # A flat self.alpha would just rescale the whole loss (absorbed by the LR).
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        F_loss = alpha_t * (1 - pt) ** self.gamma * BCE_loss
+
+        # Optional per-class importance weights (e.g. for class imbalance)
         if self.class_weights is not None:
             F_loss = F_loss * self.class_weights.to(inputs.device)
-        
-        return F_loss.mean()
 
-jaccard_loss = SoftJaccardLoss()
+        return F_loss.mean()
 
 class ChestXrayDataset(Dataset):
     """Multi-view (frontal + lateral) multi-label chest X-ray dataset.
@@ -396,7 +414,7 @@ class BiomedCLIPClassifier(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen_params = total_params - trainable_params
         
-        logger.info(f"📊 Model Parameters:")
+        logger.info(f" Model Parameters:")
         logger.info(f"   Total: {total_params:,}")
         logger.info(f"   Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
         logger.info(f"   Frozen: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
@@ -418,7 +436,7 @@ class BiomedCLIPClassifier(nn.Module):
 
         return self.classifier(fused)
 
-def train_epoch(model, train_loader, criterion, jaccard_loss, optimizer, device):
+def train_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     preds, labels_all = [], []
@@ -433,7 +451,7 @@ def train_epoch(model, train_loader, criterion, jaccard_loss, optimizer, device)
         optimizer.zero_grad()
         outputs = model(frontal, lateral, f_mask, l_mask)
 
-        loss = 0.7 * criterion(outputs, labels) + 0.3 * jaccard_loss(outputs, labels)
+        loss = criterion(outputs, labels)  # 100% focal loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -973,7 +991,7 @@ def search_best_epochs(config, epochs_list=[100]):
             train_loader = DataLoader(
                 ChestXrayDataset(train_df, config['image_dir'], model.preprocess_train, label_columns=label_columns),
                 batch_size=config['batch_size'], shuffle=True,
-                num_workers=config['num_workers'], pin_memory=True
+                num_workers=config['num_workers'], pin_memory=True, drop_last=True
             )
             val_loader = DataLoader(
                 ChestXrayDataset(val_df, config['image_dir'], model.preprocess_val, label_columns=label_columns),
@@ -981,58 +999,64 @@ def search_best_epochs(config, epochs_list=[100]):
                 num_workers=config['num_workers'], pin_memory=True
             )
             
-            # Optimizer
-            optimizer = torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                lr=config['lr'], weight_decay=config['weight_decay']
+            # Optimizer (discriminative LRs) + LR scheduler
+            optimizer = build_optimizer(model, config)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', factor=0.5, patience=3
             )
-            
-            # Train for specified epochs
-            logger.info(f"\n  Training for {epochs} epochs...")
+
+            checkpoint_path = f"epoch_search_e{epochs}_fold{fold}_new.pth"
+            best_val_auc, best_train_auc, patience_counter = 0.0, 0.0, 0
+
+            # Train with early stopping; checkpoint the BEST-validation epoch
+            logger.info(f"\n  Training up to {epochs} epochs "
+                        f"(early stopping patience={config['patience']})...")
             for epoch in range(epochs):
                 train_loss, train_preds, train_labels = train_epoch(
-    model, train_loader, criterion, jaccard_loss, optimizer, device
-)
+                    model, train_loader, criterion, optimizer, device
+                )
 
-                
-                # Compute metrics every 10 epochs
+                val_loss, val_preds, val_labels = evaluate(
+                    model, val_loader, criterion, device
+                )
+                val_metrics = compute_metrics(val_preds, val_labels)
+                scheduler.step(val_metrics['auc'])
+
                 if (epoch + 1) % 10 == 0:
                     train_metrics = compute_metrics(train_preds, train_labels)
-                    logger.info(f"  Epoch {epoch+1}/{epochs}: Train Jaccard_Acc={train_metrics['accuracy']:.4f}, AUC={train_metrics['auc']:.4f}")
-            
-            # Final validation and training metrics
-            val_loss, val_preds, val_labels = evaluate(
-                model, val_loader, criterion, device
-            )
-            val_metrics = compute_metrics(val_preds, val_labels)
-            
-            # Also compute final training metrics
-            train_loss, train_preds, train_labels = evaluate(
-                model, train_loader, criterion, device
-            )
-            train_metrics = compute_metrics(train_preds, train_labels)
-            
-            fold_aucs.append(val_metrics['auc'])
-            logger.info(f"\n  Fold {fold} Results:")
-            logger.info(f"    Train - Jaccard_Acc: {train_metrics['accuracy']:.4f}, AUC: {train_metrics['auc']:.4f}")
-            logger.info(f"    Val   - Jaccard_Acc: {val_metrics['accuracy']:.4f}, AUC: {val_metrics['auc']:.4f}")
-            
-            # Save checkpoint for this fold
-            checkpoint_path = f"epoch_search_e{epochs}_fold{fold}_new.pth"
-            torch.save({
-                'epoch': epochs,
-                'fold': fold,
-                'model_state_dict': model.state_dict(),
-                'train_auc': train_metrics['auc'],
-                'val_auc': val_metrics['auc'],
-                'label_columns': label_columns,
-                'train_df': train_df,
-                'val_df': val_df
-            }, checkpoint_path)
+                    logger.info(f"  Epoch {epoch+1}/{epochs}: "
+                                f"Train AUC={train_metrics['auc']:.4f}, "
+                                f"Val AUC={val_metrics['auc']:.4f}")
+
+                # Checkpoint best-validation epoch + early stopping
+                if val_metrics['auc'] > best_val_auc:
+                    best_val_auc = val_metrics['auc']
+                    best_train_auc = compute_metrics(train_preds, train_labels)['auc']
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'fold': fold,
+                        'model_state_dict': model.state_dict(),
+                        'train_auc': best_train_auc,
+                        'val_auc': best_val_auc,
+                        'label_columns': label_columns,
+                        'train_df': train_df,
+                        'val_df': val_df
+                    }, checkpoint_path)
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= config['patience']:
+                        logger.info(f"  Early stopping at epoch {epoch+1} "
+                                    f"(best Val AUC={best_val_auc:.4f})")
+                        break
+
+            fold_aucs.append(best_val_auc)
+            logger.info(f"\n  Fold {fold} Results: Best Val AUC={best_val_auc:.4f} "
+                        f"(Train AUC={best_train_auc:.4f})")
             fold_checkpoints.append({
                 'path': checkpoint_path,
-                'val_auc': val_metrics['auc'],
-                'train_auc': train_metrics['auc']
+                'val_auc': best_val_auc,
+                'train_auc': best_train_auc
             })
         
         mean_auc = np.mean(fold_aucs)
@@ -1219,19 +1243,16 @@ def train_pipeline(config):
         train_loader = DataLoader(
             ChestXrayDataset(train_df, config['image_dir'], model.preprocess_train, label_columns=label_columns),
             batch_size=config['batch_size'], shuffle=True,
-            num_workers=config['num_workers'], pin_memory=True
+            num_workers=config['num_workers'], pin_memory=True, drop_last=True
         )
         val_loader = DataLoader(
             ChestXrayDataset(val_df, config['image_dir'], model.preprocess_val, label_columns=label_columns),
             batch_size=config['batch_size'], shuffle=False,
             num_workers=config['num_workers'], pin_memory=True
         )
-        
-        # Optimizer
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=config['lr'], weight_decay=config['weight_decay']
-        )
+
+        # Optimizer (discriminative LRs)
+        optimizer = build_optimizer(model, config)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='max', factor=0.5, patience=3
         )
@@ -1244,7 +1265,7 @@ def train_pipeline(config):
             
             # Train
             train_loss, train_preds, train_labels = train_epoch(
-    model, train_loader, criterion, jaccard_loss, optimizer, device
+    model, train_loader, criterion, optimizer, device
 )
 
             train_metrics = compute_metrics(train_preds, train_labels)
@@ -1318,11 +1339,21 @@ def train_pipeline(config):
         num_workers=config['num_workers'], pin_memory=True
     )
     
+    # Learn per-class thresholds on a held-out validation split (NOT the test set)
+    # to avoid threshold-tuning leakage into the reported test metrics.
+    _, val_df = train_test_split(train_val_df, test_size=0.2, random_state=42)
+    val_loader = DataLoader(
+        ChestXrayDataset(val_df, config['image_dir'], model.preprocess_val, label_columns=label_columns),
+        batch_size=config['batch_size'], shuffle=False,
+        num_workers=config['num_workers'], pin_memory=True
+    )
+    _, val_preds, val_labels = evaluate(model, val_loader, criterion, device)
+    per_class_thresholds = learn_per_class_thresholds(val_preds, val_labels)
+
     test_loss, test_preds, test_labels = evaluate(model, test_loader, criterion, device)
-    test_metrics = compute_metrics(test_preds, test_labels)
-    
+    test_metrics = compute_metrics(test_preds, test_labels, per_class_thresholds=per_class_thresholds)
+
     logger.info(f"Test: Loss={test_loss:.4f}, Jaccard_Acc={test_metrics['accuracy']:.4f}, AUC={test_metrics['auc']:.4f}, F1={test_metrics['f1']:.4f}")
-    per_class_thresholds = learn_per_class_thresholds(test_preds, test_labels)
     # Comprehensive evaluation
     comprehensive_evaluation(
     test_preds, test_labels, label_columns, per_class_thresholds
@@ -1343,14 +1374,14 @@ def evaluate_pipeline(config):
     df, label_columns, class_weights = load_dataset(config['csv_dir'])
     df = filter_existing_views(df, config['image_dir'])
     
-    # Split: Use same 20% test set as in training
+    # Split: Use same 20% test set as in training (keep the 80% for threshold tuning)
     strat_col = safe_stratify_column(df, 'label_for_stratification')
     if strat_col is None:
-        _, test_df = train_test_split(
+        train_val_df, test_df = train_test_split(
             df, test_size=0.2, random_state=42, shuffle=True
         )
     else:
-        _, test_df = train_test_split(
+        train_val_df, test_df = train_test_split(
             df, test_size=0.2, random_state=42, stratify=strat_col
         )
     logger.info(f"Test samples: {len(test_df)}")
@@ -1383,8 +1414,17 @@ def evaluate_pipeline(config):
 
 
 
+    # Learn per-class thresholds on a held-out validation split (NOT the test set)
+    # to avoid threshold-tuning leakage into the reported test metrics.
+    _, val_df = train_test_split(train_val_df, test_size=0.2, random_state=42)
+    val_loader = DataLoader(
+        ChestXrayDataset(val_df, config['image_dir'], model.preprocess_val, label_columns=label_columns),
+        batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers']
+    )
+    _, val_preds, val_labels = evaluate(model, val_loader, criterion, device)
+    per_class_thresholds = learn_per_class_thresholds(val_preds, val_labels)
+
     _, test_preds, test_labels = evaluate(model, test_loader, criterion, device)
-    per_class_thresholds = learn_per_class_thresholds(test_preds, test_labels)
     # Comprehensive evaluation
     comprehensive_evaluation(
     test_preds, test_labels, label_columns, per_class_thresholds
@@ -1421,7 +1461,9 @@ def main():
                        help='Number of last transformer blocks to unfreeze (0=all frozen, 2=recommended)')
     
     args = parser.parse_args()
-    
+
+    set_seed(42)  # reproducible runs
+
     config = {
         'csv_dir': args.csv_dir,
         'image_dir': args.image_dir,
@@ -1429,6 +1471,7 @@ def main():
         'batch_size': args.batch_size,
         'epochs': args.epochs,
         'lr': args.lr,
+        'head_lr_mult': 10,  # classifier head trains at lr * head_lr_mult
         'weight_decay': 1e-4,
         'num_workers': args.num_workers,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
