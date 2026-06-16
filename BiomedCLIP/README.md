@@ -6,7 +6,7 @@
 This module implements a **BiomedCLIP-based multi-label classification system** for chest radiography. It fine-tunes a pre-trained medical vision-language model (ViT-B/16) to predict 34+ disease categories from chest X-ray images.
 
 ### Core Components
-- **Training Script** (`train_jaccard_new.py`) - Fine-tunes BiomedCLIP **multi-view** (frontal + lateral per patient) with Focal Loss and Soft Jaccard Loss
+- **Training Script** (`train_jaccard_new.py`) - Fine-tunes BiomedCLIP **multi-view** (frontal + lateral per patient) with Focal Loss
 - **Inference Script** (`test_predicted_classes.py`) - Feature-level dual-view fusion and conflict resolution for test predictions
 - **Dataset** - Indiana University chest X-ray collection with clinical labels
 
@@ -288,8 +288,9 @@ High accuracy values are expected due to the dominance of negative labels per im
 
 **Training Strategy:**
 - Partial fine-tuning (last N transformer blocks unfrozen via `--unfreeze_layers`)
-- Focal Loss (α = 0.25, γ = 2.0) for class imbalance
-- 5-fold cross-validation with automated epoch search
+- Focal Loss (α = 0.25, γ = 2.0) with proper per-class α balancing and per-class imbalance weights
+- 5-fold cross-validation with early stopping (best-validation-AUC checkpointing)
+- Discriminative learning rates (classifier head at `lr × 10`, backbone at base `lr`)
 - Single-view patients (missing frontal *or* lateral) still train — the missing view is masked out
 
 **Model Size:**
@@ -303,11 +304,13 @@ High accuracy values are expected due to the dominance of negative labels per im
 
 
 **Hyperparameters:**
-- Optimizer: AdamW (lr=2e-5, weight_decay=1e-4)
+- Optimizer: AdamW with discriminative LRs (backbone lr=2e-5, head lr=2e-4, weight_decay=1e-4)
 - Scheduler: ReduceLROnPlateau (factor=0.5, patience=3)
-- Loss: Focal Loss (α=0.25, γ=2.0)
-- Early stopping: patience=5
+- Loss: Focal Loss (α=0.25, γ=2.0) — 100% focal, no auxiliary loss
+- Early stopping: patience=5 (best-validation-AUC checkpoint kept)
 - Gradient clipping: max_norm=1.0
+- Reproducibility: fixed seed (42) across Python/NumPy/Torch/CUDA + cuDNN deterministic
+- `drop_last=True` on training loaders (avoids batch-size-1 BatchNorm errors)
 
 **Training Time (on GPU):**
 - Single epoch: ~40 seconds
@@ -357,7 +360,7 @@ It must **not** be used for clinical decision-making or diagnostic deployment wi
 
 ## Training: train_jaccard_new.py
 
-Fine-tunes BiomedCLIP on Indiana chest X-ray data using multi-label classification losses, **multi-view per patient**.
+Fine-tunes BiomedCLIP on Indiana chest X-ray data using a multi-label focal loss, **multi-view per patient**.
 
 ### Multi-View, Multi-Label Classification Approach
 
@@ -365,29 +368,21 @@ Each sample is **one patient (uid)** with up to two views (frontal + lateral). T
 - Patient example: Cardiomegaly + Pleural Effusion + Edema (3 concurrent labels)
 - Input: frontal + lateral images (a missing view is masked out)
 - Output: 34 independent sigmoid probabilities (one per disease category)
-- Loss: Combines per-class losses across all 34 binary classification tasks
+- Loss: Focal Loss applied per-class across all 34 binary classification tasks
 
-### Loss Functions
+### Loss Function
 
-#### Soft Jaccard Loss (Primary)
-Measures set overlap between predicted and ground truth labels:
-```
-Jaccard = Intersection / Union
-       = (prediction ∩ ground_truth) / (prediction ∪ ground_truth)
-Loss = 1 - mean(Jaccard per sample)
-```
-- Differentiable approximation using sigmoid probabilities
-- Directly optimizes multi-label IoU metric
-- Rewards correct prediction of multiple labels together
-
-#### Focal Loss (Class Imbalance)
+#### Focal Loss (sole training objective)
 Handles extreme class imbalance (Normal: 24% vs Rare diseases: <0.1%):
 ```
-FL(p_t) = -α(1 - p_t)^γ * log(p_t)
+FL(p_t) = -α_t (1 - p_t)^γ * log(p_t)
+α_t = α for positives, (1 - α) for negatives
 ```
-- `α = 0.25`: Down-weights easy negatives
-- `γ = 2.0`: Focuses on hard examples
-- Reduces dominance of common "Normal" class
+- `α = 0.25`: proper per-class α balancing of positives vs. negatives
+  (not a flat scalar — a flat α would just rescale the loss and be absorbed by the LR)
+- `γ = 2.0`: focuses on hard examples
+- Per-class imbalance weights (`neg/pos`) applied on top, to up-weight rare classes
+- Training uses **100% focal loss** — no auxiliary Jaccard/IoU loss term
 
 ### Training Configuration
 
@@ -416,12 +411,11 @@ Classification Head:
 | **Model** | BiomedCLIP ViT-B/16 | Pre-trained on 15M biomedical images |
 | **Trainable Params** | 404K (0.2%) | Last 4 ViT blocks + projection head |
 | **Frozen Params** | 195.9M (99.8%) | Preserves biomedical pre-training |
-| **Loss** | Focal Loss (α=0.25, γ=2.0) | Primary: multi-label classification |
-| **Aux Loss** | Soft Jaccard Loss | Additional objective |
-| **Optimizer** | AdamW | lr=2e-5, weight_decay=1e-4 |
+| **Loss** | Focal Loss (α=0.25, γ=2.0) | 100% focal — sole objective, per-class α balancing |
+| **Optimizer** | AdamW (discriminative LRs) | backbone lr=2e-5, head lr=2e-4, weight_decay=1e-4 |
 | **Scheduler** | ReduceLROnPlateau | factor=0.5, patience=3 |
-| **Batch Size** | 32 | Per device |
-| **Epochs** | 100 | With early stopping (patience=5) |
+| **Batch Size** | 16 | Per device (default) |
+| **Epochs** | 100 (max) | Early stopping (patience=5), best-val-AUC checkpoint |
 | **Augmentation** | Random crop/flip/color jitter | Training only |
 
 **Performance Metrics:**
@@ -456,14 +450,13 @@ python train_jaccard_new.py --mode both --unfreeze_layers 4
 ```python
 {
   "model_state_dict": {...},
-  "epoch": 100,
+  "epoch": 25,                      # the best-validation epoch (early stopping)
   "fold": 2,
-  "train_loss": 3.486,
-  "val_loss": 3.736,
-  "train_auc": 77.06,
-  "val_auc": 72.79,
+  "train_auc": 0.7706,
+  "val_auc": 0.7279,
   "label_columns": [34 disease names],
-  "best_epoch": 25,
+  "train_df": <DataFrame>,          # fold train split
+  "val_df": <DataFrame>,            # fold val split
 }
 ```
 
@@ -657,15 +650,15 @@ Probabilities: (batch, 34) ∈ [0,1]
 - BatchNorm: Stabilizes training
 - Dropout: Regularization to prevent overfitting
 
-### Multi-Label Loss Combination
+### Multi-Label Loss
 
 During training:
 ```
-Total Loss = Focal Loss + 0.5 × Soft Jaccard Loss
+Total Loss = Focal Loss   (100% focal — no auxiliary loss)
 
-This combines:
-  1. Per-class ranking (Focal): Each disease treated independently
-  2. Set-level accuracy (Jaccard): Rewards correct multi-label sets
+  - Per-class focal loss: each of the 34 diseases treated as an
+    independent binary task, with α_t balancing + per-class weights
+    to counter extreme imbalance.
 ```
 
 ---
@@ -797,10 +790,12 @@ The BiomedCLIP classifier feeds predicted classes to the Knowledge Graph module:
 - **Unfreeze last 4 blocks**: Adapt to Indiana domain specifics
 - **Result**: Better generalization, prevents catastrophic forgetting
 
-### 2. Soft Jaccard Loss for Multi-label
-- Standard BCE treats each class independently
-- Jaccard rewards **correct label sets** as a whole
-- Better for clinical scenarios where diseases co-occur
+### 2. Focal Loss for Multi-label Imbalance
+- Standard BCE is overwhelmed by the dominant negative labels (~1.76 positives / 34)
+- Focal `(1 - p_t)^γ` down-weights easy negatives and focuses on hard examples
+- `α_t` balancing + per-class `neg/pos` weights up-weight rare diseases
+- Per-class threshold tuning (on a held-out val split) recovers set-level quality
+  without needing a separate IoU/Jaccard loss term
 
 ### 3. Dual-View Fusion at the Feature Level
 - **Chosen**: Encode both views and fuse their feature vectors (masked mean) inside the model, so fusion is **learned jointly** during training
@@ -823,7 +818,6 @@ The BiomedCLIP classifier feeds predicted classes to the Knowledge Graph module:
 
 - **BiomedCLIP**: Domain-adapted vision-language model for biomedical images
 - **Focal Loss**: Lin et al., 2017 (handles class imbalance)
-- **Soft Jaccard Loss**: Differentiable IoU metric for set-level optimization
 - **Dataset**: Indiana University Chest X-Ray Collection
 - **OpenCLIP**: Open implementation of CLIP
 
@@ -833,7 +827,7 @@ The BiomedCLIP classifier feeds predicted classes to the Knowledge Graph module:
 
 - [ ] Multi-region attention for pathology localization
 - [ ] Uncertainty calibration for clinical deployment
-- [ ] Per-class threshold optimization (instead of global 0.5)
+- [x] Per-class threshold optimization (learned on a held-out val split — implemented)
 - [ ] Temporal prediction (compare with prior exams)
 - [ ] Explainable AI: visualize which image regions influence predictions
 - [ ] Real-time inference API for clinical integration
